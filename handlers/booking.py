@@ -97,10 +97,29 @@ async def choose_slot(call: CallbackQuery):
     slot_id = int(call.data.split(":")[1])
     user_id = call.from_user.id
     
+    # 🔒 КРИТИЧЕСКАЯ ПРОВЕРКА: слот ещё свободен?
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT dt FROM timeslots WHERE id=?", (slot_id,))
+        cur = await db.execute("SELECT dt, is_booked FROM timeslots WHERE id=?", (slot_id,))
         row = await cur.fetchone()
-        slot_dt = datetime.fromisoformat(row[0])
+        
+        if not row:
+            await call.answer("❌ Слот не найден", show_alert=True)
+            return
+        
+        dt_str, is_booked = row
+        
+        if is_booked:
+            await call.answer(
+                "😔 К сожалению, этот слот только что заняли.\n"
+                "Попробуй выбрать другое время.",
+                show_alert=True
+            )
+            # Возвращаем к выбору слотов на тот же день
+            date_str = datetime.fromisoformat(dt_str).date().isoformat()
+            await pick_date_internal(call, date_str)
+            return
+        
+        slot_dt = datetime.fromisoformat(dt_str)
     
     pending[user_id] = {
         "slot_id": slot_id,
@@ -131,6 +150,41 @@ async def choose_slot(call: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
     )
     await call.answer()
+
+
+async def pick_date_internal(call: CallbackQuery, date_str: str):
+    """Внутренняя функция для повторного показа слотов"""
+    date_obj = datetime.fromisoformat(date_str).date()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, dt FROM timeslots WHERE is_booked=0 AND date(dt)=? ORDER BY dt",
+            (date_obj.isoformat(),)
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        await call.message.edit_text("😔 На этот день больше нет свободных окон")
+        return
+
+    kb_rows = []
+    for sid, dt in rows:
+        t = datetime.fromisoformat(dt).strftime("%H:%M")
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=t,
+                callback_data=f"slot:{sid}"
+            )
+        ])
+
+    kb_rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_calendar")
+    ])
+
+    await call.message.edit_text(
+        f"📅 {date_obj.strftime('%d.%m.%Y')}\nВыбери другое время:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
 
 
 @router.callback_query(F.data.startswith("toggle:"))
@@ -221,30 +275,65 @@ async def confirm_booking(call: CallbackQuery):
             cur = await db.execute("SELECT id FROM users WHERE tg_id=?", (user_id,))
             uid = (await cur.fetchone())[0]
 
-        # Проверить свободность слота
-        cur = await db.execute("SELECT dt, is_booked FROM timeslots WHERE id=?", (slot_id,))
-        slot = await cur.fetchone()
-        if not slot:
-            await call.answer("Слот не найден 😕", show_alert=True)
-            return
-        dt_str, is_booked = slot
-        if is_booked:
-            await call.answer("Увы, слот уже занят. Выбери другой.", show_alert=True)
-            return
+        # 🔒 АТОМАРНАЯ ПРОВЕРКА И БРОНИРОВАНИЕ
+        # Используем транзакцию для защиты от race condition
+        try:
+            # Начинаем транзакцию
+            await db.execute("BEGIN IMMEDIATE")
+            
+            # Проверяем свободность слота ЕЩЁ РАЗ
+            cur = await db.execute("SELECT dt, is_booked FROM timeslots WHERE id=?", (slot_id,))
+            slot = await cur.fetchone()
+            
+            if not slot:
+                await db.rollback()
+                await call.answer("Слот не найден 😕", show_alert=True)
+                return
+                
+            dt_str, is_booked = slot
+            
+            if is_booked:
+                # Слот уже занят!
+                await db.rollback()
+                await call.answer(
+                    "😔 К сожалению, пока ты выбирал услуги, этот слот уже заняли.\n"
+                    "Попробуй выбрать другое время.",
+                    show_alert=True
+                )
+                # Возвращаем к выбору слотов
+                date_str = datetime.fromisoformat(dt_str).date().isoformat()
+                await pick_date_internal(call, date_str)
+                return
 
-        # Занять слот и создать бронь
-        await db.execute("UPDATE timeslots SET is_booked=1, booked_by_user_id=? WHERE id=?", (uid, slot_id))
-        await db.execute(
-            "INSERT INTO bookings(user_id, timeslot_id, total_price, created_at) VALUES (?, ?, ?, ?)",
-            (uid, slot_id, total, datetime.utcnow().isoformat())
-        )
-        await db.commit()
+            # Всё ок, занимаем слот атомарно
+            await db.execute(
+                "UPDATE timeslots SET is_booked=1, booked_by_user_id=? WHERE id=?",
+                (uid, slot_id)
+            )
+            
+            # Создаём бронь
+            await db.execute(
+                "INSERT INTO bookings(user_id, timeslot_id, total_price, created_at) VALUES (?, ?, ?, ?)",
+                (uid, slot_id, total, datetime.utcnow().isoformat())
+            )
+            
+            # Коммитим транзакцию
+            await db.commit()
+            
+        except Exception as e:
+            await db.rollback()
+            logging.error(f"Booking error: {e}")
+            await call.answer("❌ Ошибка при бронировании. Попробуй ещё раз.", show_alert=True)
+            return
 
     pending.pop(user_id, None)
 
     when = datetime.fromisoformat(dt_str).strftime("%d.%m %H:%M")
     await call.message.edit_text(
-        f"Готово! Ты записан(а) на *{when}*.\nСумма: *{total} ₽*",
+        f"✅ *Готово!*\n\n"
+        f"Ты записан(а) на *{when}*\n"
+        f"💰 Сумма: *{total} ₽*\n\n"
+        f"Жду тебя! 💅",
         parse_mode="Markdown"
     )
 
@@ -253,12 +342,16 @@ async def confirm_booking(call: CallbackQuery):
         bot = call.bot
         await bot.send_message(
             ADMIN_ID,
-            f"Новая запись: {call.from_user.full_name} на {when}, сумма {total} ₽"
+            f"🆕 *Новая запись!*\n\n"
+            f"👤 {call.from_user.full_name}\n"
+            f"📅 {when}\n"
+            f"💰 {total} ₽",
+            parse_mode="Markdown"
         )
     except Exception as e:
         logging.warning(f"Cannot notify admin: {e}")
 
-    await call.answer()
+    await call.answer("✅ Запись создана!")
 
 
 @router.message(Command("my"))
@@ -304,18 +397,29 @@ async def cancel_booking(call: CallbackQuery):
     booking_id = int(call.data.split(":")[1])
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT timeslot_id FROM bookings WHERE id=?", (booking_id,))
-        row = await cur.fetchone()
-        if not row:
-            return await call.answer("Запись не найдена ❌", show_alert=True)
-        slot_id = row[0]
+        # 🔒 Атомарная отмена
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cur = await db.execute("SELECT timeslot_id FROM bookings WHERE id=?", (booking_id,))
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return await call.answer("Запись не найдена ❌", show_alert=True)
+            slot_id = row[0]
 
-        await db.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
-        await db.execute(
-            "UPDATE timeslots SET is_booked=0, booked_by_user_id=NULL WHERE id=?",
-            (slot_id,)
-        )
-        await db.commit()
+            await db.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
+            await db.execute(
+                "UPDATE timeslots SET is_booked=0, booked_by_user_id=NULL WHERE id=?",
+                (slot_id,)
+            )
+            
+            await db.commit()
+            
+        except Exception as e:
+            await db.rollback()
+            logging.error(f"Cancel booking error: {e}")
+            return await call.answer("Ошибка отмены", show_alert=True)
 
     await call.message.edit_text("✅ Запись успешно отменена!")
     await call.answer()
@@ -325,7 +429,7 @@ async def cancel_booking(call: CallbackQuery):
         bot = call.bot
         await bot.send_message(
             ADMIN_ID,
-            f"Пользователь {call.from_user.full_name} отменил запись #{booking_id}"
+            f"❌ Пользователь {call.from_user.full_name} отменил запись #{booking_id}"
         )
     except Exception as e:
         logging.warning(f"Cannot notify admin: {e}")
@@ -386,27 +490,41 @@ async def confirm_reschedule(call: CallbackQuery):
     new_slot_id = int(new_slot_id_str)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT timeslot_id FROM bookings WHERE id=?", (booking_id,))
-        row = await cur.fetchone()
-        if not row:
-            return await call.answer("Бронь не найдена ❌", show_alert=True)
-        old_slot_id = row[0]
+        # 🔒 Атомарный перенос
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            
+            cur = await db.execute("SELECT timeslot_id FROM bookings WHERE id=?", (booking_id,))
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return await call.answer("Бронь не найдена ❌", show_alert=True)
+            old_slot_id = row[0]
 
-        cur = await db.execute("SELECT dt, is_booked FROM timeslots WHERE id=?", (new_slot_id,))
-        slot = await cur.fetchone()
-        if not slot or slot[1]:
-            return await call.answer("Выбранный слот уже занят 😕", show_alert=True)
+            # Проверяем новый слот
+            cur = await db.execute("SELECT dt, is_booked FROM timeslots WHERE id=?", (new_slot_id,))
+            slot = await cur.fetchone()
+            if not slot or slot[1]:
+                await db.rollback()
+                return await call.answer("Выбранный слот уже занят 😕", show_alert=True)
 
-        await db.execute("UPDATE timeslots SET is_booked=0, booked_by_user_id=NULL WHERE id=?", (old_slot_id,))
-        await db.execute(
-            "UPDATE timeslots SET is_booked=1, booked_by_user_id=(SELECT user_id FROM bookings WHERE id=?) WHERE id=?",
-            (booking_id, new_slot_id)
-        )
-        await db.execute("UPDATE bookings SET timeslot_id=?, reminded12=0 WHERE id=?", (new_slot_id, booking_id))
-        await db.commit()
-
-        cur = await db.execute("SELECT dt FROM timeslots WHERE id=?", (new_slot_id,))
-        new_dt = datetime.fromisoformat((await cur.fetchone())[0])
+            # Освобождаем старый, занимаем новый
+            await db.execute("UPDATE timeslots SET is_booked=0, booked_by_user_id=NULL WHERE id=?", (old_slot_id,))
+            await db.execute(
+                "UPDATE timeslots SET is_booked=1, booked_by_user_id=(SELECT user_id FROM bookings WHERE id=?) WHERE id=?",
+                (booking_id, new_slot_id)
+            )
+            await db.execute("UPDATE bookings SET timeslot_id=?, reminded12=0, reminded24=0, reminded1h=0 WHERE id=?", (new_slot_id, booking_id))
+            
+            await db.commit()
+            
+            cur = await db.execute("SELECT dt FROM timeslots WHERE id=?", (new_slot_id,))
+            new_dt = datetime.fromisoformat((await cur.fetchone())[0])
+            
+        except Exception as e:
+            await db.rollback()
+            logging.error(f"Reschedule error: {e}")
+            return await call.answer("Ошибка переноса", show_alert=True)
 
     await call.message.edit_text(f"✅ Запись успешно перенесена на {new_dt.strftime('%d.%m %H:%M')}!")
 
@@ -414,7 +532,7 @@ async def confirm_reschedule(call: CallbackQuery):
         bot = call.bot
         await bot.send_message(
             ADMIN_ID,
-            f"Пользователь {call.from_user.full_name} перенёс запись #{booking_id} на {new_dt.strftime('%d.%m %H:%M')}"
+            f"📅 Пользователь {call.from_user.full_name} перенёс запись #{booking_id} на {new_dt.strftime('%d.%m %H:%M')}"
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить мастера: {e}")
