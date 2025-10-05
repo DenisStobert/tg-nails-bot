@@ -50,4 +50,20 @@ async def on_contact(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, message.from_user.id))
         await db.commit()
-    await message.answer("Спасибо 👍 Телефон сохранён!", reply_markup=main_menu_kb())
+    
+    # Сразу показываем выбор услуг
+    from handlers.booking import pending
+    from keyboards.services import render_services_keyboard
+    
+    pending[message.from_user.id] = {"services": set()}
+    text, kb, _, _ = await render_services_keyboard(set())
+    
+    await message.answer("Спасибо! Телефон сохранён ✅", reply_markup=main_menu_kb())
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+
+@router.message(F.text.contains("Контакт") | F.text.contains("контакт"))
+async def contacts_button(message: Message):
+    """Обработка кнопки Контакты"""
+    from handlers.contacts import show_contacts
+    await show_contacts(message)

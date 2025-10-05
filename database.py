@@ -34,16 +34,32 @@ async def db_init():
             user_id INTEGER NOT NULL,
             timeslot_id INTEGER NOT NULL,
             total_price INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            reminded24 INTEGER DEFAULT 0,
-            reminded12 INTEGER DEFAULT 0,
-            reminded1h INTEGER DEFAULT 0,
-            confirmed INTEGER DEFAULT 0
+            created_at TEXT NOT NULL
+        )""")
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )""")
         
-        # Добавляем новые колонки если их нет (для существующих БД)
+        # Добавляем колонку duration_minutes если её нет
+        try:
+            await db.execute("ALTER TABLE services ADD COLUMN duration_minutes INTEGER DEFAULT 60")
+            await db.commit()
+            print("✅ Добавлена колонка duration_minutes")
+        except Exception:
+            pass
+        
+        # Добавляем колонки для напоминаний если их нет
         try:
             await db.execute("ALTER TABLE bookings ADD COLUMN reminded24 INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass
+        
+        try:
+            await db.execute("ALTER TABLE bookings ADD COLUMN reminded12 INTEGER DEFAULT 0")
             await db.commit()
         except Exception:
             pass
@@ -60,16 +76,21 @@ async def db_init():
         except Exception:
             pass
         
+        # Обновляем существующие услуги - устанавливаем дефолтные 60 минут
+        await db.execute("UPDATE services SET duration_minutes = 60 WHERE duration_minutes IS NULL OR duration_minutes = 0")
+        await db.commit()
+        
         # Засеем базовые услуги, если пусто
         cur = await db.execute("SELECT COUNT(*) FROM services")
         count = (await cur.fetchone())[0]
         if count == 0:
             await db.executemany(
-                "INSERT INTO services(name, price) VALUES (?, ?)",
+                "INSERT INTO services(name, price, duration_minutes) VALUES (?, ?, ?)",
                 [
-                    ("Покрытие", 1000),
-                    ("Дизайн", 500),
-                    ("Снятие", 300),
+                    ("Покрытие", 1000, 60),
+                    ("Дизайн", 500, 30),
+                    ("Снятие", 300, 30),
                 ],
             )
-        await db.commit()
+            await db.commit()
+            print("✅ Добавлены базовые услуги")

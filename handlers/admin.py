@@ -19,17 +19,22 @@ async def admin_menu(message: Message):
         "🔧 *Меню мастера:*\n\n"
         "*Управление слотами:*\n"
         "• /addslot YYYY-MM-DD HH:MM — добавить окно\n"
-        "• /generate\\_slots — генератор расписания 🆕\n"
+        "• /generate\\_slots — генератор расписания\n"
+        "• /clear\\_old\\_slots — удалить старые слоты\n"
         "• /slots — список окон\n"
         "• /del\\_slot <id> — удалить окно\n"
         "• /free\\_slot <id> — освободить окно\n\n"
         "*Управление услугами:*\n"
-        "• /addservice <название> <цена> — добавить услугу\n"
-        "• /delservice <название> — удалить услугу\n"
-        "• /setprice <название> <цена> — изменить цену\n\n"
+        "• /addservice <название> <цена> <минуты> — добавить\n"
+        "• /delservice <название> — удалить\n"
+        "• /setprice <название> <цена> — цена\n"
+        "• /set\\_duration <название> <минуты> — время\n\n"
         "*Записи и статистика:*\n"
         "• /bookings — все записи\n"
-        "• /stats — статистика 🆕\n",
+        "• /export — экспорт в CSV\n"
+        "• /stats — статистика\n\n"
+        "*Информация:*\n"
+        "• /set\\_contacts — настроить контакты",
         parse_mode="Markdown"
     )
 
@@ -656,3 +661,230 @@ async def stats_back(call: CallbackQuery):
         reply_markup=kb
     )
     await call.answer()
+
+
+@router.message(Command("debug_slots"))
+async def debug_slots(message: Message):
+    """Отладка слотов (только админ)"""
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Недостаточно прав.")
+    
+    # Проверяем какая дата
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        return await message.answer("Используй: /debug_slots 2025-10-05")
+    
+    date_str = parts[1]
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """SELECT id, dt, is_booked FROM timeslots 
+               WHERE date(dt)=? 
+               ORDER BY dt""",
+            (date_str,)
+        )
+        slots = await cur.fetchall()
+    
+    if not slots:
+        return await message.answer(f"❌ На дату {date_str} нет слотов вообще!")
+    
+    text = f"*Слоты на {date_str}:*\n\n"
+    for sid, dt, is_booked in slots:
+        status = "🔴 ЗАНЯТ" if is_booked else "🟢 СВОБОДЕН"
+        text += f"#{sid} {datetime.fromisoformat(dt).strftime('%H:%M')} {status}\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ===== ЭКСПОРТ ДАННЫХ =====
+
+@router.message(Command("export"))
+async def export_bookings(message: Message):
+    """Экспорт всех записей в CSV"""
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Недостаточно прав.")
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT 
+                b.id,
+                t.dt,
+                u.name,
+                u.phone,
+                b.total_price,
+                b.created_at,
+                COALESCE(b.confirmed, 0) as confirmed
+            FROM bookings b
+            JOIN timeslots t ON t.id = b.timeslot_id
+            JOIN users u ON u.id = b.user_id
+            ORDER BY t.dt DESC
+        """)
+        rows = await cur.fetchall()
+    
+    if not rows:
+        return await message.answer("Нет записей для экспорта")
+    
+    # Создаём CSV
+    import io
+    output = io.StringIO()
+    output.write("ID,Дата,Время,Клиент,Телефон,Сумма,Создано,Подтверждено\n")
+    
+    for bid, dt_str, name, phone, price, created, confirmed in rows:
+        dt = datetime.fromisoformat(dt_str)
+        date = dt.strftime("%d.%m.%Y")
+        time = dt.strftime("%H:%M")
+        phone_clean = phone or "нет"
+        conf_str = "Да" if confirmed else "Нет"
+        created_date = datetime.fromisoformat(created).strftime("%d.%m.%Y")
+        
+        output.write(f"{bid},{date},{time},{name},{phone_clean},{price},{created_date},{conf_str}\n")
+    
+    # Отправляем файл
+    from aiogram.types import BufferedInputFile
+    
+    file_content = output.getvalue().encode('utf-8-sig')  # BOM для Excel
+    file = BufferedInputFile(file_content, filename=f"bookings_{datetime.now().strftime('%Y%m%d')}.csv")
+    
+    await message.answer_document(
+        document=file,
+        caption=f"📊 Экспорт записей\nВсего: {len(rows)} записей"
+    )
+
+
+# ===== УПРАВЛЕНИЕ СЛОТАМИ =====
+
+@router.message(Command("clear_old_slots"))
+async def clear_old_slots(message: Message):
+    """Удалить все старые (прошедшие) слоты"""
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Недостаточно прав.")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить старые свободные", callback_data="clear_old_free")],
+        [InlineKeyboardButton(text="🗑 Удалить ВСЕ старые", callback_data="clear_old_all")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_clear")],
+    ])
+    
+    await message.answer(
+        "Какие старые слоты удалить?\n\n"
+        "• *Свободные* - только пустые слоты\n"
+        "• *Все* - включая с завершёнными записями",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "clear_old_free")
+async def clear_old_free_slots(call: CallbackQuery):
+    """Удалить старые свободные слоты"""
+    now = datetime.now().isoformat()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM timeslots WHERE dt < ? AND is_booked = 0",
+            (now,)
+        )
+        deleted = cur.rowcount
+        await db.commit()
+    
+    await call.message.edit_text(f"✅ Удалено старых свободных слотов: {deleted}")
+    await call.answer()
+
+
+@router.callback_query(F.data == "clear_old_all")
+async def clear_old_all_slots(call: CallbackQuery):
+    """Удалить ВСЕ старые слоты"""
+    now = datetime.now().isoformat()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Удаляем старые записи
+        cur = await db.execute("""
+            DELETE FROM bookings 
+            WHERE timeslot_id IN (
+                SELECT id FROM timeslots WHERE dt < ?
+            )
+        """, (now,))
+        deleted_bookings = cur.rowcount
+        
+        # Удаляем старые слоты
+        cur = await db.execute("DELETE FROM timeslots WHERE dt < ?", (now,))
+        deleted_slots = cur.rowcount
+        
+        await db.commit()
+    
+    await call.message.edit_text(
+        f"✅ Очищено:\n"
+        f"• Записей: {deleted_bookings}\n"
+        f"• Слотов: {deleted_slots}"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "cancel_clear")
+async def cancel_clear(call: CallbackQuery):
+    """Отмена очистки"""
+    await call.message.edit_text("Отменено")
+    await call.answer()
+
+
+# ===== УПРАВЛЕНИЕ УСЛУГАМИ =====
+
+@router.message(Command("set_duration"))
+async def set_duration(message: Message):
+    """Установить длительность услуги"""
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Недостаточно прав.")
+    
+    parts = message.text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return await message.answer("Используй: /set_duration <название> <минуты>")
+    
+    name = parts[1]
+    try:
+        duration = int(parts[2])
+    except ValueError:
+        return await message.answer("Длительность должна быть числом")
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE services SET duration_minutes=? WHERE LOWER(name)=LOWER(?)",
+            (duration, name)
+        )
+        await db.commit()
+        
+        if cur.rowcount == 0:
+            return await message.answer(f"Услуга '{name}' не найдена ❌")
+    
+    await message.answer(f"✅ Длительность «{name}» обновлена: {duration} минут")
+
+
+@router.message(Command("addservice"))
+async def add_service(message: Message):
+    """Добавить новую услугу"""
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Недостаточно прав.")
+
+    parts = message.text.strip().split(maxsplit=3)
+    if len(parts) < 3:
+        return await message.answer("Используй: /addservice <название> <цена> [минуты]")
+
+    name = parts[1]
+    try:
+        price = int(parts[2])
+        duration = int(parts[3]) if len(parts) > 3 else 60
+    except ValueError:
+        return await message.answer("Цена и длительность должны быть числами")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM services WHERE LOWER(name)=LOWER(?)", (name,))
+        row = await cur.fetchone()
+        if row:
+            return await message.answer(f"Услуга '{name}' уже существует ❌")
+
+        await db.execute(
+            "INSERT INTO services(name, price, duration_minutes) VALUES (?, ?, ?)", 
+            (name, price, duration)
+        )
+        await db.commit()
+
+    await message.answer(f"✅ Услуга '{name}' добавлена\n💰 Цена: {price} ₽\n⏱ Длительность: {duration} мин")
